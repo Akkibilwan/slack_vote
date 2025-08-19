@@ -45,13 +45,12 @@ def create_poll(poll_type: str, question: str, options: Dict) -> str:
 
 def cast_vote(poll_id: str, vote_data: Dict, poll_data: Dict) -> bool:
     if not poll_data or poll_data["closed"]: return False
-    # Prevent duplicates for ranked/matrix polls by checking name
     if poll_data["poll_type"] != "single":
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT vote_data FROM votes WHERE poll_id = ?", (poll_id,))
             if any(json.loads(row[0]).get("name") == vote_data.get("name") for row in cursor.fetchall()):
-                return False # Duplicate vote found
+                return False
     with sqlite3.connect(DB_PATH) as conn:
         conn.cursor().execute(
             "INSERT INTO votes (poll_id, ts, vote_data) VALUES (?, ?, ?)",
@@ -174,8 +173,7 @@ def render_vote_page(poll_data: dict):
                 st.subheader(item)
                 responses[item] = {}
                 for param_idx, param in enumerate(poll_data["options"]["criteria"]):
-                    criterion_label = param["label"]
-                    criterion_type = param["type"]
+                    criterion_label, criterion_type = param["label"], param["type"]
                     key = f"{item_idx}_{param_idx}" # Unique key
                     
                     if criterion_type == "Yes/No":
@@ -190,9 +188,77 @@ def render_vote_page(poll_data: dict):
         
         if vote_recorded: st.success("✅ Thank you, your response has been recorded!")
 
+# *** NEW: Helper functions for displaying results ***
+def display_single_choice_results(poll):
+    choices = poll["options"]["choices"]
+    totals = poll["totals"]
+    
+    # Metrics
+    cols = st.columns(min(len(choices), 4))
+    for i, choice in enumerate(choices):
+        cols[i % 4].metric(f'{EMOJIS[i]} {choice}', totals[i])
+
+    # Bar Chart
+    if sum(totals) > 0:
+        chart_data = pd.DataFrame({"options": choices, "votes": totals}).set_index("options")
+        st.bar_chart(chart_data)
+
+def display_ranked_results(poll):
+    choices = poll["options"]["choices"]
+    votes = poll["votes_log"]
+    num_choices = len(choices)
+    
+    # Borda Count weighted scores
+    scores = {choice: 0 for choice in choices}
+    for vote in votes:
+        for i, choice in enumerate(vote["ranking"]):
+            scores[choice] += (num_choices - i)
+    
+    sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    
+    st.subheader("Weighted Scores")
+    df = pd.DataFrame(sorted_scores, columns=["Option", "Score"]).set_index("Option")
+    st.bar_chart(df)
+
+    with st.expander("View individual votes"):
+        st.dataframe(pd.DataFrame([{"Voter": v["name"], **{f"Rank #{i+1}": r for i, r in enumerate(v["ranking"])}} for v in votes]), use_container_width=True, hide_index=True)
+
+def display_matrix_results(poll):
+    items = poll["options"]["items"]
+    criteria = poll["options"]["criteria"]
+    votes = poll["votes_log"]
+
+    summary_rows = []
+    for item in items:
+        row = {"Topic": item}
+        for crit in criteria:
+            label, type = crit["label"], crit["type"]
+            responses = [v["responses"].get(item, {}).get(label) for v in votes if v["responses"].get(item)]
+            
+            if type == "Yes/No":
+                yes_count = responses.count("Yes")
+                total = responses.count("Yes") + responses.count("No")
+                row[label] = f"{yes_count / total * 100:.0f}% Yes" if total > 0 else "N/A"
+            elif type == "Scale (1-5)":
+                numeric_responses = [r for r in responses if isinstance(r, (int, float))]
+                avg_score = sum(numeric_responses) / len(numeric_responses) if numeric_responses else 0
+                row[label] = f"{avg_score:.2f} avg"
+            elif type == "Text":
+                text_count = len([r for r in responses if r and str(r).strip()])
+                row[label] = f"{text_count} response(s)"
+        summary_rows.append(row)
+        
+    st.subheader("Aggregated Results")
+    st.dataframe(pd.DataFrame(summary_rows).set_index("Topic"), use_container_width=True)
+
+    with st.expander("View individual votes and text responses"):
+        df_data = [{"Voter": vote["name"], **{f"{item} - {crit['label']}": vote["responses"].get(item, {}).get(crit['label']) for item in items for crit in criteria}} for vote in votes]
+        st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
+
 def render_dashboard():
     st.title("📊 Slack Polls Dashboard")
     with st.sidebar:
+        # Sidebar logic (unchanged)...
         st.header("Configuration")
         webhook_url = st.secrets.get("SLACK_WEBHOOK_URL")
         base_url = st.secrets.get("PUBLIC_BASE_URL")
@@ -243,23 +309,15 @@ def render_dashboard():
             with results_tab:
                 if not p["votes_log"]:
                     st.info("No votes have been cast yet.")
-                if p['poll_type'] == 'single':
-                    cols = st.columns(min(len(p["options"]["choices"]), 4))
-                    for i, option in enumerate(p["options"]["choices"]):
-                        cols[i % 4].metric(f'{EMOJIS[i]} {option}', p["totals"][i])
-                elif p['poll_type'] == 'ranked' and p["votes_log"]:
-                    ranks = {f"Rank #{i+1}": [v["ranking"][i] for v in p["votes_log"]] for i in range(len(p["options"]["choices"]))}
-                    df_data = [{"Voter": v["name"], **{k: r[i] for k, r in ranks.items()}} for i, v in enumerate(p["votes_log"])]
-                    st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
-                elif p['poll_type'] == 'matrix' and p["votes_log"]:
-                    df_data = []
-                    for vote in p["votes_log"]:
-                        row = {"Voter": vote["name"]}
-                        for item in p["options"]["items"]:
-                            for crit in p["options"]["criteria"]:
-                                row[f"{item} - {crit['label']}"] = vote["responses"].get(item, {}).get(crit['label'])
-                        df_data.append(row)
-                    st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
+                else:
+                    # *** NEW: Call the appropriate display function ***
+                    if p['poll_type'] == 'single':
+                        display_single_choice_results(p)
+                    elif p['poll_type'] == 'ranked':
+                        display_ranked_results(p)
+                    elif p['poll_type'] == 'matrix':
+                        display_matrix_results(p)
+
                 st.markdown("---")
                 if not p['closed']:
                     if st.button("End poll", key=f"end_{p['id']}"): end_poll(p['id']); st.rerun()
