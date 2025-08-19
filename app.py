@@ -94,20 +94,19 @@ def update_summary(poll_id: str, summary: str):
         conn.cursor().execute("UPDATE polls SET summary = ? WHERE id = ?", (summary, poll_id))
         conn.commit()
 
-# ----------------------------- AI Summary -------------------------------- #
+# ----------------------------- AI Summary & Slack Integration -------------------------------- #
 def generate_summary(poll_data: dict, api_key: str):
+    # This function remains the same
     openai.api_key = api_key
     results = ""
-    # Create a string representation of the results based on poll type
     if poll_data['poll_type'] == 'single':
         results = "\n".join([f"- {opt}: {count} votes" for opt, count in zip(poll_data['options']['choices'], poll_data['totals'])])
     elif poll_data['poll_type'] == 'ranked':
         results = json.dumps([v['ranking'] for v in poll_data['votes_log']], indent=2)
     elif poll_data['poll_type'] == 'matrix':
         results = json.dumps(poll_data['votes_log'], indent=2)
-
     prompt = f"""
-    Based ONLY on the data provided below, generate a concise, neutral, data-driven summary of the poll results.
+    Based ONLY on the data provided below, generate a concise, neutral, data-driven summary of the poll results in Markdown format.
     - Start with a single sentence stating the main outcome.
     - Use bullet points to highlight key statistics or trends.
     - Do not add any information, opinions, or predictions not present in the data.
@@ -125,14 +124,19 @@ def generate_summary(poll_data: dict, api_key: str):
     except Exception as e:
         return f"Error generating summary: {e}"
 
+def send_summary_to_slack(webhook_url: str, poll_data: Dict):
+    text = f"📊 *Poll Closed: Summary for \"{poll_data['question']}\"*\n\n{poll_data['summary']}"
+    payload = {"text": text}
+    return requests.post(webhook_url, json=payload, timeout=10)
+
 # ----------------------------- UI & Slack Helpers -------------------------------- #
 EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 def post_poll_to_slack(webhook_url: str, base_url: str, poll_id: str, poll_data: Dict[str, Any]):
+    # This function remains the same
     question, poll_type = poll_data["question"], poll_data["poll_type"]
     params = urllib.parse.urlencode({'poll': poll_id})
     vote_url = f"{base_url}?{params}"
-
     if poll_type == "single":
         lines = [f":bar_chart: *Poll:* {question}", ""]
         for i, option in enumerate(poll_data["options"]["choices"]):
@@ -142,10 +146,10 @@ def post_poll_to_slack(webhook_url: str, base_url: str, poll_id: str, poll_data:
         title = "Ranked Poll" if poll_type == "ranked" else "Matrix Poll"
         icon = ":ballot_box_with_ballot:" if poll_type == "ranked" else ":clipboard:"
         lines = [f"{icon} *{title}:* {question}", "", f"<{vote_url}|Click Here to Respond>"]
-    
     return requests.post(webhook_url, json={"text": "\n".join(lines)}, timeout=10)
 
 def render_vote_page(poll_data: dict):
+    # This function remains the same, bug fix was in the logic flow
     st.title("🗳️ Slack Poll")
     st.header(f"*{poll_data['question']}*")
     if poll_data["closed"]:
@@ -173,7 +177,7 @@ def render_vote_page(poll_data: dict):
                 st.subheader(item)
                 responses[item] = {}
                 for param_idx, param in enumerate(poll_data["options"]["criteria"]):
-                    criterion_label, criterion_type = param["label"], param["type"]
+                    criterion_label, criterion_type = param["label"], param.get("type", "Yes/No")
                     key = f"{item_idx}_{param_idx}" # Unique key
                     
                     if criterion_type == "Yes/No":
@@ -182,59 +186,56 @@ def render_vote_page(poll_data: dict):
                         responses[item][criterion_label] = st.select_slider(criterion_label, options=range(1, 6), key=key)
                     elif criterion_type == "Text":
                         responses[item][criterion_label] = st.text_input(criterion_label, key=key)
-
+                    elif criterion_type == "Custom Select":
+                        options = param.get("options", [])
+                        responses[item][criterion_label] = st.selectbox(criterion_label, options, key=key)
             if st.button("Submit Ratings", disabled=not name.strip()):
                 vote_recorded = cast_vote(current_poll_id, {"name": name.strip(), "responses": responses}, poll_data)
-        
         if vote_recorded: st.success("✅ Thank you, your response has been recorded!")
+    # *** FIX: Handle case where user visits a single-choice poll link without a vote param ***
+    elif poll_data["poll_type"] == "single":
+        st.info("This is a single-choice poll. Please cast your vote by clicking one of the options in the Slack message.")
 
-# *** NEW: Helper functions for displaying results ***
 def display_single_choice_results(poll):
+    # This function remains the same
     choices = poll["options"]["choices"]
     totals = poll["totals"]
+    chart_data = pd.DataFrame({"votes": totals}, index=choices)
     
-    # Metrics
-    cols = st.columns(min(len(choices), 4))
-    for i, choice in enumerate(choices):
-        cols[i % 4].metric(f'{EMOJIS[i]} {choice}', totals[i])
-
-    # Bar Chart
-    if sum(totals) > 0:
-        chart_data = pd.DataFrame({"options": choices, "votes": totals}).set_index("options")
-        st.bar_chart(chart_data)
+    col1, col2 = st.columns([1,2])
+    with col1:
+        st.dataframe(chart_data)
+    with col2:
+        if sum(totals) > 0:
+            st.bar_chart(chart_data)
 
 def display_ranked_results(poll):
-    choices = poll["options"]["choices"]
-    votes = poll["votes_log"]
+    # This function remains the same
+    choices, votes = poll["options"]["choices"], poll["votes_log"]
     num_choices = len(choices)
-    
-    # Borda Count weighted scores
     scores = {choice: 0 for choice in choices}
     for vote in votes:
         for i, choice in enumerate(vote["ranking"]):
             scores[choice] += (num_choices - i)
+    df = pd.DataFrame(sorted(scores.items(), key=lambda item: item[1], reverse=True), columns=["Option", "Score"]).set_index("Option")
     
-    sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    
-    st.subheader("Weighted Scores")
-    df = pd.DataFrame(sorted_scores, columns=["Option", "Score"]).set_index("Option")
-    st.bar_chart(df)
-
+    col1, col2 = st.columns([1,2])
+    with col1:
+        st.dataframe(df)
+    with col2:
+        st.bar_chart(df)
     with st.expander("View individual votes"):
         st.dataframe(pd.DataFrame([{"Voter": v["name"], **{f"Rank #{i+1}": r for i, r in enumerate(v["ranking"])}} for v in votes]), use_container_width=True, hide_index=True)
 
 def display_matrix_results(poll):
-    items = poll["options"]["items"]
-    criteria = poll["options"]["criteria"]
-    votes = poll["votes_log"]
-
+    # This function remains the same
+    items, criteria, votes = poll["options"]["items"], poll["options"]["criteria"], poll["votes_log"]
     summary_rows = []
     for item in items:
         row = {"Topic": item}
         for crit in criteria:
-            label, type = crit["label"], crit["type"]
+            label, type = crit["label"], crit.get("type", "Yes/No")
             responses = [v["responses"].get(item, {}).get(label) for v in votes if v["responses"].get(item)]
-            
             if type == "Yes/No":
                 yes_count = responses.count("Yes")
                 total = responses.count("Yes") + responses.count("No")
@@ -243,14 +244,12 @@ def display_matrix_results(poll):
                 numeric_responses = [r for r in responses if isinstance(r, (int, float))]
                 avg_score = sum(numeric_responses) / len(numeric_responses) if numeric_responses else 0
                 row[label] = f"{avg_score:.2f} avg"
-            elif type == "Text":
+            else: # Text or Custom Select
                 text_count = len([r for r in responses if r and str(r).strip()])
                 row[label] = f"{text_count} response(s)"
         summary_rows.append(row)
-        
     st.subheader("Aggregated Results")
     st.dataframe(pd.DataFrame(summary_rows).set_index("Topic"), use_container_width=True)
-
     with st.expander("View individual votes and text responses"):
         df_data = [{"Voter": vote["name"], **{f"{item} - {crit['label']}": vote["responses"].get(item, {}).get(crit['label']) for item in items for crit in criteria}} for vote in votes]
         st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
@@ -258,7 +257,7 @@ def display_matrix_results(poll):
 def render_dashboard():
     st.title("📊 Slack Polls Dashboard")
     with st.sidebar:
-        # Sidebar logic (unchanged)...
+        # Configuration part is the same
         st.header("Configuration")
         webhook_url = st.secrets.get("SLACK_WEBHOOK_URL")
         base_url = st.secrets.get("PUBLIC_BASE_URL")
@@ -266,6 +265,7 @@ def render_dashboard():
         if webhook_url and base_url: st.success("✅ Config loaded.")
         else: st.error("🚨 Config missing in secrets.toml!")
         st.markdown("---")
+        # Poll creation part updated for custom select
         st.subheader("Create a New Poll")
         poll_type = st.radio("Poll Type", ["Single Choice", "Ranked Preference", "Matrix"])
         question = st.text_input("Poll Question", key="poll_question")
@@ -279,19 +279,22 @@ def render_dashboard():
             options_data["choices"] = [c.strip() for c in st.session_state.choices if c.strip()]
         elif poll_type == "Matrix":
             if "matrix_items" not in st.session_state: st.session_state.matrix_items = ["Topic A"]
-            if "matrix_criteria" not in st.session_state: st.session_state.matrix_criteria = [{"label": "Wider TAM?", "type": "Yes/No"}]
+            if "matrix_criteria" not in st.session_state: st.session_state.matrix_criteria = [{"label": "Wider TAM?", "type": "Yes/No", "options": ""}]
             st.write("**Topics to Rate**")
             for i in range(len(st.session_state.matrix_items)):
                 st.session_state.matrix_items[i] = st.text_input(f"Topic {i+1}", st.session_state.matrix_items[i], key=f"item_{i}")
             c1, c2 = st.columns(2); c1.button("Add Topic", on_click=lambda: st.session_state.matrix_items.append("")); c2.button("Remove Last Topic", on_click=lambda: st.session_state.matrix_items.pop())
             st.write("**Criteria**")
             for i in range(len(st.session_state.matrix_criteria)):
+                crit = st.session_state.matrix_criteria[i]
                 c1, c2 = st.columns([2, 1])
-                st.session_state.matrix_criteria[i]["label"] = c1.text_input(f"Criterion {i+1}", st.session_state.matrix_criteria[i]["label"], key=f"crit_label_{i}")
-                st.session_state.matrix_criteria[i]["type"] = c2.selectbox("Type", ["Yes/No", "Scale (1-5)", "Text"], key=f"crit_type_{i}", index=["Yes/No", "Scale (1-5)", "Text"].index(st.session_state.matrix_criteria[i]["type"]))
-            c1, c2 = st.columns(2); c1.button("Add Criterion", on_click=lambda: st.session_state.matrix_criteria.append({"label": "", "type": "Yes/No"})); c2.button("Remove Last Criterion", on_click=lambda: st.session_state.matrix_criteria.pop())
+                crit["label"] = c1.text_input(f"Criterion {i+1}", crit["label"], key=f"crit_label_{i}")
+                crit["type"] = c2.selectbox("Type", ["Yes/No", "Scale (1-5)", "Text", "Custom Select"], key=f"crit_type_{i}", index=["Yes/No", "Scale (1-5)", "Text", "Custom Select"].index(crit.get("type", "Yes/No")))
+                if crit["type"] == "Custom Select":
+                    crit["options"] = st.text_input("Options (comma-separated)", crit.get("options", ""), key=f"crit_opts_{i}")
+            c1, c2 = st.columns(2); c1.button("Add Criterion", on_click=lambda: st.session_state.matrix_criteria.append({"label": "", "type": "Yes/No", "options": ""})); c2.button("Remove Last Criterion", on_click=lambda: st.session_state.matrix_criteria.pop())
             options_data["items"] = [i.strip() for i in st.session_state.matrix_items if i.strip()]
-            options_data["criteria"] = [c for c in st.session_state.matrix_criteria if c["label"].strip()]
+            options_data["criteria"] = [{"label": c["label"].strip(), "type": c["type"], "options": [o.strip() for o in c.get("options", "").split(',') if o.strip()]} for c in st.session_state.matrix_criteria if c["label"].strip()]
 
         if st.button("Create & Post", type="primary", disabled=not all([webhook_url, base_url, question, options_data])):
             pid = create_poll(poll_type.lower().replace(" ", "_"), question, options_data)
@@ -304,20 +307,14 @@ def render_dashboard():
         with st.container(border=True):
             status = '🔒 Closed' if p['closed'] else '🟢 Open'
             st.markdown(f"**{p['question']}** (`{p['poll_type'].replace('_', ' ').title()}`)\n\n`{p['id']}` | **Votes: {len(p['votes_log'])}** | Status: **{status}**")
-            
             results_tab, summary_tab = st.tabs(["📊 Results", "✨ AI Summary"])
             with results_tab:
                 if not p["votes_log"]:
                     st.info("No votes have been cast yet.")
                 else:
-                    # *** NEW: Call the appropriate display function ***
-                    if p['poll_type'] == 'single':
-                        display_single_choice_results(p)
-                    elif p['poll_type'] == 'ranked':
-                        display_ranked_results(p)
-                    elif p['poll_type'] == 'matrix':
-                        display_matrix_results(p)
-
+                    if p['poll_type'] == 'single': display_single_choice_results(p)
+                    elif p['poll_type'] == 'ranked': display_ranked_results(p)
+                    elif p['poll_type'] == 'matrix': display_matrix_results(p)
                 st.markdown("---")
                 if not p['closed']:
                     if st.button("End poll", key=f"end_{p['id']}"): end_poll(p['id']); st.rerun()
@@ -325,6 +322,11 @@ def render_dashboard():
                 if p['closed']:
                     if p.get('summary'):
                         st.markdown(p['summary'])
+                        # *** NEW: Send summary to Slack button ***
+                        if st.button("Send Summary to Slack", key=f"send_{p['id']}"):
+                            resp = send_summary_to_slack(webhook_url, p)
+                            if resp.ok: st.success("Summary posted to Slack!")
+                            else: st.error(f"Failed to post to Slack: {resp.text}")
                     elif st.button("Generate Summary", key=f"sum_{p['id']}", disabled=not st.session_state.get('openai_api_key')):
                         with st.spinner("Generating AI summary..."):
                             summary = generate_summary(p, st.session_state.openai_api_key)
