@@ -2,6 +2,7 @@ import os
 import uuid
 import time
 import json
+import sqlite3
 import urllib.parse
 from datetime import datetime
 from typing import Dict, Any, List
@@ -9,84 +10,131 @@ from typing import Dict, Any, List
 import requests
 import streamlit as st
 
-# ----------------------------- storage helpers ------------------------------ #
+# --------------------------- database helpers (sqlite) ---------------------------- #
+DB_PATH = os.path.join(os.environ.get("DATA_DIR", "."), "polls.db")
 
-DATA_DIR = os.environ.get("DATA_DIR", ".")
-os.makedirs(DATA_DIR, exist_ok=True)
-POLLS_PATH = os.path.join(DATA_DIR, "polls.json")
-
-def _default_store() -> Dict[str, Any]:
-    return {"polls": {}}
-
-def load_store() -> Dict[str, Any]:
-    if not os.path.exists(POLLS_PATH):
-        return _default_store()
-    try:
-        with open(POLLS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return _default_store()
-
-def save_store(store: Dict[str, Any]) -> None:
-    tmp = POLLS_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(store, f, indent=2)
-    os.replace(tmp, POLLS_PATH)
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS polls (
+                id TEXT PRIMARY KEY,
+                poll_type TEXT NOT NULL,
+                question TEXT NOT NULL,
+                options TEXT NOT NULL, -- JSON array of strings
+                created_at INTEGER NOT NULL,
+                closed INTEGER NOT NULL DEFAULT 0
+            );
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                poll_id TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                vote_data TEXT NOT NULL, -- JSON object
+                FOREIGN KEY (poll_id) REFERENCES polls (id)
+            );
+        ''')
+        conn.commit()
 
 def create_poll(poll_type: str, question: str, options: List[str]) -> str:
-    store = load_store()
     pid = uuid.uuid4().hex[:10]
-    store["polls"][pid] = {
-        "type": poll_type,
-        "question": question,
-        "options": options,
-        "created_at": int(time.time()),
-        "closed": False,
-        "totals": [0] * len(options),
-        "votes_log": []
-    }
-    save_store(store)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO polls (id, poll_type, question, options, created_at, closed) VALUES (?, ?, ?, ?, ?, ?)",
+            (pid, poll_type, question, json.dumps(options), int(time.time()), 0)
+        )
+        conn.commit()
     return pid
 
-def cast_vote(poll_id: str, option_index: int) -> bool:
-    store = load_store()
-    poll = store["polls"].get(poll_id)
-    if not poll or poll["closed"] or poll.get("type") != "single":
+def cast_vote(poll_id: str, option_index: int, poll_data: Dict) -> bool:
+    if not poll_data or poll_data["closed"] or poll_data.get("poll_type") != "single":
         return False
-    if not 0 <= option_index < len(poll["options"]):
-        return False
-    poll["totals"][option_index] += 1
-    poll["votes_log"].append({"ts": int(time.time()), "option_index": option_index})
-    save_store(store)
+    vote_data = json.dumps({"option_index": option_index})
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO votes (poll_id, ts, vote_data) VALUES (?, ?, ?)",
+            (poll_id, int(time.time()), vote_data)
+        )
+        conn.commit()
     return True
 
-def cast_ranked_vote(poll_id: str, name: str, ranking: List[str]) -> bool:
-    store = load_store()
-    poll = store["polls"].get(poll_id)
-    if not poll or poll["closed"] or poll.get("type") != "ranked":
+def cast_ranked_vote(poll_id: str, name: str, ranking: List[str], poll_data: Dict) -> bool:
+    if not poll_data or poll_data["closed"] or poll_data.get("poll_type") != "ranked":
         return False
-    if any(vote.get("name") == name for vote in poll["votes_log"]):
-        return False
-    poll["votes_log"].append({"ts": int(time.time()), "name": name, "ranking": ranking})
-    save_store(store)
+    # Check for existing vote by the same name
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT vote_data FROM votes WHERE poll_id = ?", (poll_id,))
+        for row in cursor.fetchall():
+            if json.loads(row[0]).get("name") == name:
+                return False # Duplicate vote
+    
+    vote_data = json.dumps({"name": name, "ranking": ranking})
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO votes (poll_id, ts, vote_data) VALUES (?, ?, ?)",
+            (poll_id, int(time.time()), vote_data)
+        )
+        conn.commit()
     return True
+
 
 def end_poll(poll_id: str) -> bool:
-    store = load_store()
-    poll = store["polls"].get(poll_id)
-    if not poll: return False
-    poll["closed"] = True
-    save_store(store)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE polls SET closed = 1 WHERE id = ?", (poll_id,))
+        conn.commit()
     return True
 
-def get_poll(poll_id: str) -> Dict[str, Any]:
-    return load_store()["polls"].get(poll_id)
+def get_poll(poll_id: str) -> Dict[str, Any] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM polls WHERE id = ?", (poll_id,))
+        poll_row = cursor.fetchone()
+        if not poll_row:
+            return None
+        poll = dict(poll_row)
+        poll["options"] = json.loads(poll["options"])
+        return poll
+
+def list_polls() -> List[Dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM polls ORDER BY created_at DESC")
+        polls_rows = cursor.fetchall()
+        
+        polls = []
+        for row in polls_rows:
+            poll = dict(row)
+            poll["options"] = json.loads(poll["options"])
+            poll["votes_log"] = []
+            poll["totals"] = [0] * len(poll["options"])
+            
+            cursor.execute("SELECT vote_data FROM votes WHERE poll_id = ?", (poll["id"],))
+            votes_rows = cursor.fetchall()
+            
+            for v_row in votes_rows:
+                vote_data = json.loads(v_row["vote_data"])
+                poll["votes_log"].append(vote_data)
+                if poll["poll_type"] == "single":
+                    opt_idx = vote_data.get("option_index")
+                    if isinstance(opt_idx, int) and 0 <= opt_idx < len(poll["totals"]):
+                        poll["totals"][opt_idx] += 1
+            polls.append(poll)
+    return polls
+
 
 # ----------------------------- slack helpers -------------------------------- #
 EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 def post_poll_to_slack(webhook_url: str, base_url: str, poll_id: str, poll_data: Dict[str, Any]):
-    poll_type = poll_data.get("type", "single")
+    poll_type = poll_data.get("poll_type", "single")
     question = poll_data["question"]
     options = poll_data["options"]
 
@@ -96,18 +144,21 @@ def post_poll_to_slack(webhook_url: str, base_url: str, poll_id: str, poll_data:
             params = urllib.parse.urlencode({"poll": poll_id, "vote": i + 1})
             vote_url = f"{base_url}?{params}"
             text_lines.append(f"{EMOJIS[i]} <{vote_url}|{option}>")
-        text_lines.append("\n_Click an option to vote. Results are shown in the dashboard._")
+        text_lines.append("\n_Click an option to vote. Results are in the dashboard._")
     else: # ranked
         vote_url = f"{base_url}?{urllib.parse.urlencode({'poll': poll_id})}"
         text_lines = [
             f":ballot_box_with_ballot: *Ranked Preference Poll:* {question}", "",
             f"<{vote_url}|Click here to rank your choices>", "",
-            f"_You will be asked to rank all {len(options)} options in your order of preference._"
+            f"_You will be asked to rank all {len(options)} options._"
         ]
     payload = {"text": "\n".join(text_lines)}
     return requests.post(webhook_url, json=payload, timeout=10)
 
 # --------------------------------- UI --------------------------------------- #
+
+# Initialize database on first run
+init_db()
 
 st.set_page_config(page_title="Slack Polls", page_icon="📊", layout="wide")
 params = st.query_params
@@ -115,29 +166,25 @@ current_poll_id = params.get("poll")
 poll_data = get_poll(current_poll_id) if current_poll_id else None
 
 # --- Main Page vs. Voting Page Logic ---
-if poll_data and poll_data.get("type") == "ranked" and "vote" not in params:
+if poll_data and poll_data.get("poll_type") == "ranked" and "vote" not in params:
     # RANKED VOTING PAGE
     st.title("🗳️ Rank Your Preference")
     st.header(poll_data["question"])
     num_options = len(poll_data["options"])
-
     if poll_data["closed"]:
         st.error("This poll has been closed.")
     else:
         name = st.text_input("Enter your name to vote (case-sensitive)")
         ranking = st.multiselect(
-            f"Select the options below in your desired order of preference (1st, 2nd, etc.).",
-            options=poll_data["options"],
-            placeholder="Click to select your 1st choice, then 2nd, and so on...",
-            max_selections=num_options
+            "Select in your desired order of preference", options=poll_data["options"], max_selections=num_options
         )
         if st.button("Submit My Ranking", type="primary", disabled=not (name.strip() and len(ranking) == num_options)):
-            if cast_ranked_vote(current_poll_id, name.strip(), ranking):
+            if cast_ranked_vote(current_poll_id, name.strip(), ranking, poll_data):
                 st.success("✅ **Vote recorded!** You can close this tab.")
             else:
                 st.error("⚠️ **Could not record vote.** You may have already voted.")
         if len(ranking) != num_options:
-            st.warning(f"Please select and rank all {num_options} options to submit.")
+            st.warning(f"Please select and rank all {num_options} options.")
 else:
     # MAIN DASHBOARD PAGE
     st.title("📊 Slack Polls Dashboard")
@@ -145,33 +192,33 @@ else:
     if "poll" in params and "vote" in params:
         try:
             vote_idx = int(params.get("vote")) - 1
-            if cast_vote(current_poll_id, vote_idx):
+            if cast_vote(current_poll_id, vote_idx, poll_data):
                 vote_ack.success("✅ **Vote recorded!** You can close this tab.")
             else:
                 vote_ack.warning("⚠️ Poll not found, closed, or invalid.")
         except Exception:
             vote_ack.error("❌ Invalid vote link.")
 
-    # --- Sidebar for settings and poll creation ---
     with st.sidebar:
-        st.header("Settings")
+        st.header("Configuration")
         webhook_url = st.secrets.get("SLACK_WEBHOOK_URL")
-        if webhook_url:
-            st.success("✅ Slack Webhook loaded from secrets.")
-        else:
-            st.error("🚨 Slack Webhook not found!")
-            st.caption("Add your webhook to `.streamlit/secrets.toml`.")
+        base_url = st.secrets.get("PUBLIC_BASE_URL")
         
-        base_url = st.text_input("Public URL of this app", placeholder="https://your-app.streamlit.app")
+        if webhook_url and base_url:
+            st.success("✅ Configuration loaded from secrets.")
+        else:
+            st.error("🚨 Config missing from secrets!")
+            st.caption("Add `SLACK_WEBHOOK_URL` and `PUBLIC_BASE_URL` to `.streamlit/secrets.toml`.")
         st.markdown("---")
 
         st.subheader("Create a New Poll")
-        poll_type = st.radio("Poll Type", ["Single Choice", "Ranked Preference"], horizontal=True)
-        question = st.text_input("Poll Question", placeholder="What should we focus on next?")
         
-        # Dynamic options management
-        if "options" not in st.session_state:
-            st.session_state.options = ["Feature A", "Feature B"]
+        # Use session state to manage form inputs
+        if "question" not in st.session_state: st.session_state.question = ""
+        if "options" not in st.session_state: st.session_state.options = ["Option A", "Option B"]
+
+        st.session_state.question = st.text_input("Poll Question", value=st.session_state.question, key="question_input")
+        poll_type = st.radio("Poll Type", ["Single Choice", "Ranked Preference"], horizontal=True)
         
         for i in range(len(st.session_state.options)):
             st.session_state.options[i] = st.text_input(f"Option {i + 1}", st.session_state.options[i], key=f"opt_{i}")
@@ -186,33 +233,34 @@ else:
 
         options = [opt.strip() for opt in st.session_state.options if opt.strip()]
         
-        create_disabled = not all([webhook_url, base_url.strip(), question.strip(), len(options) >= 2])
+        create_disabled = not all([webhook_url, base_url, st.session_state.question.strip(), len(options) >= 2])
         if st.button("Create & Post to Slack", type="primary", disabled=create_disabled):
             poll_type_val = "ranked" if poll_type == "Ranked Preference" else "single"
-            pid = create_poll(poll_type_val, question.strip(), options)
+            pid = create_poll(poll_type_val, st.session_state.question.strip(), options)
             new_poll_data = get_poll(pid)
             resp = post_poll_to_slack(webhook_url.strip(), base_url.strip(), pid, new_poll_data)
             if resp.ok:
-                st.success(f"Poll posted! Poll ID: {pid}")
+                st.success(f"Poll posted! ID: {pid}")
+                # Reset form for next poll
+                st.session_state.question = ""
+                st.session_state.options = ["Option A", "Option B"]
+                st.rerun()
             else:
                 st.error(f"Post to Slack failed: {resp.status_code} {resp.text}")
 
-    # --- Main dashboard display ---
     st.markdown("---")
     st.subheader("Polls")
-    polls = load_store()["polls"]
+    polls = list_polls()
     if not polls:
         st.info("No polls created yet. Use the sidebar to create one!")
     else:
-        ordered = sorted(polls.items(), key=lambda kv: kv[1]["created_at"], reverse=True)
-        for pid, p in ordered:
+        for p in polls:
             with st.container(border=True):
-                poll_type_str = "Ranked Preference" if p.get("type") == "ranked" else "Single Choice"
                 status = '🔒 Closed' if p['closed'] else '🟢 Open'
                 total_votes = len(p["votes_log"])
-                st.markdown(f"**{p['question']}** (`{poll_type_str}`)\n\n`{pid}` | **Total Votes: {total_votes}** | Status: **{status}**")
+                st.markdown(f"**{p['question']}** (`{p['poll_type'].replace('_', ' ').title()}`)\n\n`{p['id']}` | **Votes: {total_votes}** | Status: **{status}**")
                 
-                if p.get("type") == "single":
+                if p["poll_type"] == "single":
                     num_options = len(p["options"])
                     rows = [p["options"][i:i + 4] for i in range(0, num_options, 4)]
                     start_index = 0
@@ -223,7 +271,6 @@ else:
                             with cols[c_idx]:
                                 st.metric(f'{EMOJIS[total_index]} {option}', p["totals"][total_index])
                         start_index += len(row_options)
-
                 else: # ranked
                     if p["votes_log"]:
                         import pandas as pd
@@ -232,10 +279,8 @@ else:
                             for row_idx, vote in enumerate(p["votes_log"]):
                                 df_data[row_idx][f"Rank #{i+1}"] = vote["ranking"][i]
                         st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("No ranked votes have been cast yet.")
                 
                 if not p["closed"]:
-                    if st.button("End this poll", key=f"end_{pid}"):
-                        end_poll(pid)
+                    if st.button("End this poll", key=f"end_{p['id']}"):
+                        end_poll(p['id'])
                         st.rerun()
